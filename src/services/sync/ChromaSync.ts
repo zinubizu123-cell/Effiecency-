@@ -40,6 +40,8 @@ interface StoredObservation {
   discovery_tokens: number; // ROI metrics
   created_at: string;
   created_at_epoch: number;
+  branch?: string | null;
+  commit_sha?: string | null;
 }
 
 interface StoredSummary {
@@ -56,6 +58,8 @@ interface StoredSummary {
   discovery_tokens: number; // ROI metrics
   created_at: string;
   created_at_epoch: number;
+  branch?: string | null;
+  commit_sha?: string | null;
 }
 
 interface StoredUserPrompt {
@@ -151,6 +155,12 @@ export class ChromaSync {
     if (files_modified.length > 0) {
       baseMetadata.files_modified = files_modified.join(',');
     }
+    if (obs.branch) {
+      baseMetadata.branch = obs.branch;
+    }
+    if (obs.commit_sha) {
+      baseMetadata.commit_sha = obs.commit_sha;
+    }
 
     // Narrative as separate document
     if (obs.narrative) {
@@ -197,6 +207,13 @@ export class ChromaSync {
       created_at_epoch: summary.created_at_epoch,
       prompt_number: summary.prompt_number || 0
     };
+
+    if (summary.branch) {
+      baseMetadata.branch = summary.branch;
+    }
+    if (summary.commit_sha) {
+      baseMetadata.commit_sha = summary.commit_sha;
+    }
 
     // Each field becomes a separate document
     if (summary.request) {
@@ -308,7 +325,9 @@ export class ChromaSync {
     obs: ParsedObservation,
     promptNumber: number,
     createdAtEpoch: number,
-    discoveryTokens: number = 0
+    discoveryTokens: number = 0,
+    branch?: string | null,
+    commitSha?: string | null
   ): Promise<void> {
     // Convert ParsedObservation to StoredObservation format
     const stored: StoredObservation = {
@@ -327,7 +346,9 @@ export class ChromaSync {
       prompt_number: promptNumber,
       discovery_tokens: discoveryTokens,
       created_at: new Date(createdAtEpoch * 1000).toISOString(),
-      created_at_epoch: createdAtEpoch
+      created_at_epoch: createdAtEpoch,
+      branch: branch,
+      commit_sha: commitSha
     };
 
     const documents = this.formatObservationDocs(stored);
@@ -352,7 +373,9 @@ export class ChromaSync {
     summary: ParsedSummary,
     promptNumber: number,
     createdAtEpoch: number,
-    discoveryTokens: number = 0
+    discoveryTokens: number = 0,
+    branch?: string | null,
+    commitSha?: string | null
   ): Promise<void> {
     // Convert ParsedSummary to StoredSummary format
     const stored: StoredSummary = {
@@ -368,7 +391,9 @@ export class ChromaSync {
       prompt_number: promptNumber,
       discovery_tokens: discoveryTokens,
       created_at: new Date(createdAtEpoch * 1000).toISOString(),
-      created_at_epoch: createdAtEpoch
+      created_at_epoch: createdAtEpoch,
+      branch: branch,
+      commit_sha: commitSha
     };
 
     const documents = this.formatSummaryDocs(stored);

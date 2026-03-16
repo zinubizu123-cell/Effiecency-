@@ -102,7 +102,9 @@ export async function processAgentResponse(
     summaryForStore,
     session.lastPromptNumber,
     discoveryTokens,
-    originalTimestamp ?? undefined
+    originalTimestamp ?? undefined,
+    session.lastBranch,
+    session.lastCommitSha
   );
 
   // Log storage result with IDs for end-to-end traceability
@@ -200,7 +202,9 @@ async function syncAndBroadcastObservations(
       obs,
       session.lastPromptNumber,
       result.createdAtEpoch,
-      discoveryTokens
+      discoveryTokens,
+      session.lastBranch,
+      session.lastCommitSha
     ).then(() => {
       const chromaDuration = Date.now() - chromaStart;
       logger.debug('CHROMA', 'Observation synced', {
@@ -293,7 +297,9 @@ async function syncAndBroadcastSummary(
     summaryForStore,
     session.lastPromptNumber,
     result.createdAtEpoch,
-    discoveryTokens
+    discoveryTokens,
+    session.lastBranch,
+    session.lastCommitSha
   ).then(() => {
     const chromaDuration = Date.now() - chromaStart;
     logger.debug('CHROMA', 'Summary synced', {

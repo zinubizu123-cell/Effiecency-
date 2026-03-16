@@ -51,6 +51,9 @@ export class SessionStore {
     this.addOnUpdateCascadeToForeignKeys();
     this.addObservationContentHashColumn();
     this.addSessionCustomTitleColumn();
+    this.addObservationBranchColumns();
+    this.addPendingMessagesBranchColumns();
+    this.addSummaryBranchColumns();
   }
 
   /**
@@ -874,6 +877,80 @@ export class SessionStore {
   }
 
   /**
+   * Add branch and commit_sha columns to observations table (migration 24)
+   */
+  private addObservationBranchColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(24) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const hasBranch = tableInfo.some(col => col.name === 'branch');
+    const hasCommitSha = tableInfo.some(col => col.name === 'commit_sha');
+
+    if (!hasBranch) {
+      this.db.run('ALTER TABLE observations ADD COLUMN branch TEXT');
+      logger.debug('DB', 'Added branch column to observations table');
+    }
+
+    if (!hasCommitSha) {
+      this.db.run('ALTER TABLE observations ADD COLUMN commit_sha TEXT');
+      logger.debug('DB', 'Added commit_sha column to observations table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
+  }
+
+  /**
+   * Add branch and commit_sha columns to pending_messages for branch memory (migration 25)
+   * Ensures branch metadata survives the persistent work queue round-trip.
+   */
+  private addPendingMessagesBranchColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(25) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasBranch = tableInfo.some(col => col.name === 'branch');
+    const hasCommitSha = tableInfo.some(col => col.name === 'commit_sha');
+
+    if (!hasBranch) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN branch TEXT');
+      logger.debug('DB', 'Added branch column to pending_messages table');
+    }
+
+    if (!hasCommitSha) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN commit_sha TEXT');
+      logger.debug('DB', 'Added commit_sha column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+  }
+
+  /**
+   * Add branch and commit_sha columns to session_summaries for branch memory (migration 26)
+   * Enables backfill to propagate branch metadata through to Chroma vector search.
+   */
+  private addSummaryBranchColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(26) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(session_summaries)').all() as TableColumnInfo[];
+    const hasBranch = tableInfo.some(col => col.name === 'branch');
+    const hasCommitSha = tableInfo.some(col => col.name === 'commit_sha');
+
+    if (!hasBranch) {
+      this.db.run('ALTER TABLE session_summaries ADD COLUMN branch TEXT');
+      logger.debug('DB', 'Added branch column to session_summaries table');
+    }
+
+    if (!hasCommitSha) {
+      this.db.run('ALTER TABLE session_summaries ADD COLUMN commit_sha TEXT');
+      logger.debug('DB', 'Added commit_sha column to session_summaries table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
+  }
+
+  /**
    * Update the memory session ID for a session
    * Called by SDKAgent when it captures the session ID from the first SDK message
    * Also used to RESET to null on stale resume failures (worker-service.ts)
@@ -1186,11 +1263,11 @@ export class SessionStore {
    */
   getObservationsByIds(
     ids: number[],
-    options: { orderBy?: 'date_desc' | 'date_asc'; limit?: number; project?: string; type?: string | string[]; concepts?: string | string[]; files?: string | string[] } = {}
+    options: { orderBy?: 'date_desc' | 'date_asc'; limit?: number; project?: string; type?: string | string[]; concepts?: string | string[]; files?: string | string[]; commit_sha?: string | string[] } = {}
   ): ObservationRecord[] {
     if (ids.length === 0) return [];
 
-    const { orderBy = 'date_desc', limit, project, type, concepts, files } = options;
+    const { orderBy = 'date_desc', limit, project, type, concepts, files, commit_sha } = options;
     const orderClause = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const limitClause = limit ? `LIMIT ${limit}` : '';
 
@@ -1237,6 +1314,18 @@ export class SessionStore {
         params.push(`%${file}%`, `%${file}%`);
       });
       additionalConditions.push(`(${fileConditions.join(' OR ')})`);
+    }
+
+    // Apply commit_sha filter (branch ancestry filtering)
+    if (commit_sha) {
+      if (Array.isArray(commit_sha)) {
+        const shaPlaceholders = commit_sha.map(() => '?').join(',');
+        additionalConditions.push(`(commit_sha IS NULL OR commit_sha IN (${shaPlaceholders}))`);
+        params.push(...commit_sha);
+      } else {
+        additionalConditions.push('(commit_sha IS NULL OR commit_sha = ?)');
+        params.push(commit_sha);
+      }
     }
 
     const whereClause = additionalConditions.length > 0
@@ -1576,7 +1665,9 @@ export class SessionStore {
     },
     promptNumber?: number,
     discoveryTokens: number = 0,
-    overrideTimestampEpoch?: number
+    overrideTimestampEpoch?: number,
+    branch?: string | null,
+    commitSha?: string | null
   ): { id: number; createdAtEpoch: number } {
     // Use override timestamp if provided (for processing backlog messages with original timestamps)
     const timestampEpoch = overrideTimestampEpoch ?? Date.now();
@@ -1585,8 +1676,9 @@ export class SessionStore {
     const stmt = this.db.prepare(`
       INSERT INTO session_summaries
       (memory_session_id, project, request, investigated, learned, completed,
-       next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch,
+       branch, commit_sha)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const result = stmt.run(
@@ -1601,7 +1693,9 @@ export class SessionStore {
       promptNumber || null,
       discoveryTokens,
       timestampIso,
-      timestampEpoch
+      timestampEpoch,
+      branch ?? null,
+      commitSha ?? null
     );
 
     return {
@@ -1649,7 +1743,9 @@ export class SessionStore {
     } | null,
     promptNumber?: number,
     discoveryTokens: number = 0,
-    overrideTimestampEpoch?: number
+    overrideTimestampEpoch?: number,
+    branch?: string | null,
+    commitSha?: string | null
   ): { observationIds: number[]; summaryId: number | null; createdAtEpoch: number } {
     // Use override timestamp if provided
     const timestampEpoch = overrideTimestampEpoch ?? Date.now();
@@ -1663,8 +1759,9 @@ export class SessionStore {
       const obsStmt = this.db.prepare(`
         INSERT INTO observations
         (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
-         files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch,
+         branch, commit_sha)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const observation of observations) {
@@ -1691,7 +1788,9 @@ export class SessionStore {
           discoveryTokens,
           contentHash,
           timestampIso,
-          timestampEpoch
+          timestampEpoch,
+          branch ?? null,
+          commitSha ?? null
         );
         observationIds.push(Number(result.lastInsertRowid));
       }
@@ -1702,8 +1801,9 @@ export class SessionStore {
         const summaryStmt = this.db.prepare(`
           INSERT INTO session_summaries
           (memory_session_id, project, request, investigated, learned, completed,
-           next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch,
+           branch, commit_sha)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
 
         const result = summaryStmt.run(
@@ -1718,7 +1818,9 @@ export class SessionStore {
           promptNumber || null,
           discoveryTokens,
           timestampIso,
-          timestampEpoch
+          timestampEpoch,
+          branch ?? null,
+          commitSha ?? null
         );
         summaryId = Number(result.lastInsertRowid);
       }
