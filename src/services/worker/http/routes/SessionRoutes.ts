@@ -27,6 +27,11 @@ export class SessionRoutes extends BaseRouteHandler {
   private completionHandler: SessionCompletionHandler;
   private spawnInProgress = new Map<number, boolean>();
   private crashRecoveryScheduled = new Set<number>();
+  // Track sessions where SDK agent init failed to prevent infinite retry loops (#623)
+  // TODO: This Set is unbounded and only cleaned on session-complete, which may never fire
+  // for permanently broken sessions. Low risk in practice (failed inits are rare), but if
+  // long-running workers accumulate many failures, consider adding max-size eviction or TTL.
+  private failedInitSessions = new Set<number>();
 
   constructor(
     private sessionManager: SessionManager,
@@ -307,6 +312,10 @@ export class SessionRoutes extends BaseRouteHandler {
       });
   }
 
+  private clearFailedInitTracking(sessionDbId: number): void {
+    this.failedInitSessions.delete(sessionDbId);
+  }
+
   setupRoutes(app: express.Application): void {
     // Legacy session endpoints (use sessionDbId)
     app.post('/sessions/:sessionDbId/init', this.handleSessionInit.bind(this));
@@ -337,7 +346,18 @@ export class SessionRoutes extends BaseRouteHandler {
       has_userPrompt: !!userPrompt
     });
 
-    const session = this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
+    let session;
+    try {
+      session = this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
+    } catch (error) {
+      // Track failed init to prevent infinite retry loops (#623)
+      this.failedInitSessions.add(sessionDbId);
+      logger.error('SESSION', 'SDK agent init failed — session marked as failed to prevent retry loop', {
+        sessionDbId,
+        promptNumber
+      }, error as Error);
+      throw error; // Re-throw so wrapHandler returns 500
+    }
 
     // Get the latest user_prompt for this session to sync to Chroma
     const latestPrompt = this.dbManager.getSessionStore().getLatestUserPrompt(session.contentSessionId);
@@ -472,6 +492,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
+    this.clearFailedInitTracking(sessionDbId);
     await this.completionHandler.completeByDbId(sessionDbId);
 
     res.json({ status: 'deleted' });
@@ -485,6 +506,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
+    this.clearFailedInitTracking(sessionDbId);
     await this.completionHandler.completeByDbId(sessionDbId);
 
     res.json({ success: true });
@@ -656,6 +678,8 @@ export class SessionRoutes extends BaseRouteHandler {
     // Pass empty strings - we only need the ID lookup, not to create a new session
     const sessionDbId = store.createSDKSession(contentSessionId, '', '');
 
+    this.clearFailedInitTracking(sessionDbId);
+
     // Check if session is in the active sessions map
     const activeSession = this.sessionManager.getSession(sessionDbId);
     if (!activeSession) {
@@ -759,9 +783,11 @@ export class SessionRoutes extends BaseRouteHandler {
     // Step 5: Save cleaned user prompt
     store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
 
-    // Step 6: Check if SDK agent is already running for this session (#1079)
-    // If contextInjected is true, the hook should skip re-initializing the SDK agent
-    const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
+    // Step 6: Check if SDK agent is already running (or failed) for this session (#1079, #623)
+    // If contextInjected is true, the hook should skip re-initializing the SDK agent.
+    // Also returns true for sessions where init failed — prevents infinite retry loops (#623).
+    const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined
+      || this.failedInitSessions.has(sessionDbId);
 
     // Debug-level log since CREATED already logged the key info
     logger.debug('SESSION', 'User prompt saved', {
