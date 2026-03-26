@@ -71,7 +71,7 @@ export class SettingsDefaultsManager {
    * Default values for all settings
    */
   private static readonly DEFAULTS: SettingsDefaults = {
-    CLAUDE_MEM_MODEL: 'claude-sonnet-4-5',
+    CLAUDE_MEM_MODEL: 'haiku',
     CLAUDE_MEM_CONTEXT_OBSERVATIONS: '50',
     CLAUDE_MEM_WORKER_PORT: '37777',
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1',
@@ -220,6 +220,17 @@ export class SettingsDefaultsManager {
         } catch (error) {
           console.warn('[SETTINGS] Failed to auto-migrate settings file:', settingsPath, error);
           // Continue with in-memory migration even if write fails
+        }
+      }
+
+      // MIGRATION: Upgrade old default model value
+      if (flatSettings.CLAUDE_MEM_MODEL === 'claude-sonnet-4-5') {
+        flatSettings.CLAUDE_MEM_MODEL = this.DEFAULTS.CLAUDE_MEM_MODEL;
+        try {
+          writeFileSync(settingsPath, JSON.stringify(flatSettings, null, 2), 'utf-8');
+          console.log('[SETTINGS] Migrated CLAUDE_MEM_MODEL to', this.DEFAULTS.CLAUDE_MEM_MODEL);
+        } catch (error) {
+          console.warn('[SETTINGS] Failed to persist model migration:', error);
         }
       }
 

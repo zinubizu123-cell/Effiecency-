@@ -240,6 +240,39 @@ describe('SettingsDefaultsManager', () => {
       });
     });
 
+    describe('model value migration', () => {
+      it('should migrate claude-sonnet-4-5 to current default model', () => {
+        const oldSettings = { CLAUDE_MEM_MODEL: 'claude-sonnet-4-5' };
+        writeFileSync(settingsPath, JSON.stringify(oldSettings));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+        const defaults = SettingsDefaultsManager.getAllDefaults();
+
+        expect(result.CLAUDE_MEM_MODEL).toBe(defaults.CLAUDE_MEM_MODEL);
+      });
+
+      it('should persist migrated model value to file', () => {
+        const oldSettings = { CLAUDE_MEM_MODEL: 'claude-sonnet-4-5' };
+        writeFileSync(settingsPath, JSON.stringify(oldSettings));
+
+        SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        const defaults = SettingsDefaultsManager.getAllDefaults();
+
+        expect(parsed.CLAUDE_MEM_MODEL).toBe(defaults.CLAUDE_MEM_MODEL);
+      });
+
+      it('should not migrate non-old-default model values', () => {
+        const settings = { CLAUDE_MEM_MODEL: 'custom-model' };
+        writeFileSync(settingsPath, JSON.stringify(settings));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_MODEL).toBe('custom-model');
+      });
+    });
+
     describe('edge cases', () => {
       it('should handle empty object in file', () => {
         writeFileSync(settingsPath, '{}');
@@ -309,25 +342,79 @@ describe('SettingsDefaultsManager', () => {
 
   describe('get', () => {
     it('should return default value for key', () => {
-      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-sonnet-4-5');
-      expect(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')).toBe('37777');
+      const originalModel = process.env.CLAUDE_MEM_MODEL;
+      const originalWorkerPort = process.env.CLAUDE_MEM_WORKER_PORT;
+      delete process.env.CLAUDE_MEM_MODEL;
+      delete process.env.CLAUDE_MEM_WORKER_PORT;
+      try {
+        expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('haiku');
+        expect(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')).toBe('37777');
+      } finally {
+        if (originalModel === undefined) {
+          delete process.env.CLAUDE_MEM_MODEL;
+        } else {
+          process.env.CLAUDE_MEM_MODEL = originalModel;
+        }
+        if (originalWorkerPort === undefined) {
+          delete process.env.CLAUDE_MEM_WORKER_PORT;
+        } else {
+          process.env.CLAUDE_MEM_WORKER_PORT = originalWorkerPort;
+        }
+      }
     });
   });
 
   describe('getInt', () => {
     it('should return integer value for numeric string', () => {
-      expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_WORKER_PORT')).toBe(37777);
-      expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_CONTEXT_OBSERVATIONS')).toBe(50);
+      const originalWorkerPort = process.env.CLAUDE_MEM_WORKER_PORT;
+      const originalObservations = process.env.CLAUDE_MEM_CONTEXT_OBSERVATIONS;
+      delete process.env.CLAUDE_MEM_WORKER_PORT;
+      delete process.env.CLAUDE_MEM_CONTEXT_OBSERVATIONS;
+      try {
+        expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_WORKER_PORT')).toBe(37777);
+        expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_CONTEXT_OBSERVATIONS')).toBe(50);
+      } finally {
+        if (originalWorkerPort === undefined) {
+          delete process.env.CLAUDE_MEM_WORKER_PORT;
+        } else {
+          process.env.CLAUDE_MEM_WORKER_PORT = originalWorkerPort;
+        }
+        if (originalObservations === undefined) {
+          delete process.env.CLAUDE_MEM_CONTEXT_OBSERVATIONS;
+        } else {
+          process.env.CLAUDE_MEM_CONTEXT_OBSERVATIONS = originalObservations;
+        }
+      }
     });
   });
 
   describe('getBool', () => {
     it('should return true for "true" string', () => {
-      expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT')).toBe(true);
+      const originalSavingsPercent = process.env.CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT;
+      delete process.env.CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT;
+      try {
+        expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT')).toBe(true);
+      } finally {
+        if (originalSavingsPercent === undefined) {
+          delete process.env.CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT;
+        } else {
+          process.env.CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT = originalSavingsPercent;
+        }
+      }
     });
 
     it('should return false for non-"true" string', () => {
-      expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE')).toBe(false);
+      const originalLastMessage = process.env.CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE;
+      delete process.env.CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE;
+      try {
+        expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE')).toBe(false);
+      } finally {
+        if (originalLastMessage === undefined) {
+          delete process.env.CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE;
+        } else {
+          process.env.CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE = originalLastMessage;
+        }
+      }
     });
   });
 
