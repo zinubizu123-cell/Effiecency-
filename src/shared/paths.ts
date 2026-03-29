@@ -1,4 +1,4 @@
-import { join, dirname, basename, sep } from 'path';
+import { join, dirname, basename, sep, resolve } from 'path';
 import { homedir } from 'os';
 import { existsSync, mkdirSync } from 'fs';
 import { execSync } from 'child_process';
@@ -132,16 +132,27 @@ export function ensureAllClaudeDirs(): void {
  * Get current project name from git root or cwd.
  * Includes parent directory to avoid collisions when repos share a folder name
  * (e.g., ~/work/monorepo → "work/monorepo" vs ~/personal/monorepo → "personal/monorepo").
+ *
+ * Worktree-aware: uses --git-common-dir to resolve to the parent repo,
+ * not the worktree directory. (#1500)
  */
 export function getCurrentProjectName(): string {
   try {
-    const gitRoot = execSync('git rev-parse --show-toplevel', {
+    // --git-common-dir returns the main repo's .git dir even from a worktree,
+    // whereas --show-toplevel returns the worktree's checkout dir.
+    const gitCommonDir = execSync('git rev-parse --git-common-dir', {
       cwd: process.cwd(),
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true
     }).trim();
-    return basename(dirname(gitRoot)) + '/' + basename(gitRoot);
+
+    // gitCommonDir is either ".git" (main repo) or an absolute path like
+    // "/Users/me/git/myproject/.git" (from worktree). Resolve to repo root.
+    const absoluteGitDir = resolve(process.cwd(), gitCommonDir);
+    // Strip trailing .git to get repo root
+    const repoRoot = dirname(absoluteGitDir);
+    return basename(dirname(repoRoot)) + '/' + basename(repoRoot);
   } catch (error) {
     logger.debug('SYSTEM', 'Git root detection failed, using cwd basename', {
       cwd: process.cwd()
