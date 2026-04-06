@@ -6,7 +6,7 @@
  * can be selected via CLAUDE_MEM_MODE setting.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import type { ModeConfig, ObservationType, ObservationConcept } from './types.js';
 import { logger } from '../../utils/logger.js';
@@ -16,6 +16,7 @@ export class ModeManager {
   private static instance: ModeManager | null = null;
   private activeMode: ModeConfig | null = null;
   private modesDir: string;
+  private resolvedModes: Map<string, ModeConfig> = new Map();
 
   private constructor() {
     // Modes are in plugin/modes/
@@ -208,6 +209,23 @@ export class ModeManager {
   }
 
   /**
+   * Resolve a mode by ID without changing the global active mode.
+   * Used for per-session mode overrides (e.g., GStack auto-detection).
+   * Caches results to avoid re-reading files on every prompt.
+   */
+  resolveMode(modeId: string): ModeConfig {
+    const cached = this.resolvedModes.get(modeId);
+    if (cached) return cached;
+
+    // Temporarily save and restore activeMode since loadMode() sets it as a side effect
+    const previousActive = this.activeMode;
+    const resolved = this.loadMode(modeId);
+    this.activeMode = previousActive;
+    this.resolvedModes.set(modeId, resolved);
+    return resolved;
+  }
+
+  /**
    * Get all observation types from active mode
    */
   getObservationTypes(): ObservationType[] {
@@ -250,5 +268,37 @@ export class ModeManager {
   getTypeLabel(typeId: string): string {
     const type = this.getObservationTypes().find(t => t.id === typeId);
     return type?.label || typeId;
+  }
+
+  /**
+   * List all available mode IDs from the modes directory.
+   * Returns mode metadata (id, name, description) for each .json file found.
+   */
+  listAvailableModes(): Array<{ id: string; name: string; description: string }> {
+    if (!existsSync(this.modesDir)) return [];
+
+    return readdirSync(this.modesDir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        const modeId = f.replace('.json', '');
+        try {
+          const content = JSON.parse(readFileSync(join(this.modesDir, f), 'utf-8'));
+          return {
+            id: modeId,
+            name: content.name || modeId,
+            description: content.description || ''
+          };
+        } catch {
+          return { id: modeId, name: modeId, description: '' };
+        }
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /**
+   * Get the modes directory path (for creating new mode files)
+   */
+  getModesDir(): string {
+    return this.modesDir;
   }
 }
