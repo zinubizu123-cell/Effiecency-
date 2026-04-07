@@ -229,6 +229,45 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     }
   },
   {
+    name: 'get_session',
+    description: 'Resolve a memory_session_id to its Claude Code session ID and name. Params: memory_session_ids (array of memory_session_id strings, required)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_session_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of memory_session_id values from get_observations results'
+        }
+      },
+      required: ['memory_session_ids'],
+      additionalProperties: false
+    },
+    handler: async (args: any) => {
+      const res = await workerHttpRequest('/api/sdk-sessions/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ memorySessionIds: args.memory_session_ids })
+      });
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Worker API error (${res.status}): ${errorText}`);
+      }
+      const rows = await res.json() as Array<any>;
+      const metadata = rows.map(({ memory_session_id, content_session_id, custom_title, project, started_at, status }: any) => ({
+        memory_session_id,
+        content_session_id,
+        custom_title,
+        project,
+        started_at,
+        status
+      }));
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify(metadata, null, 2) }]
+      };
+    }
+  },
+  {
     name: 'smart_search',
     description: 'Search codebase for symbols, functions, classes using tree-sitter AST parsing. Returns folded structural views with token counts. Use path parameter to scope the search.',
     inputSchema: {
