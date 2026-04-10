@@ -101,7 +101,7 @@ export class SearchRoutes extends BaseRouteHandler {
 
   /**
    * Search session summaries
-   * GET /api/search/sessions?query=...&limit=20
+   * GET /api/search/sessions?query=...&limit=20&project=...
    */
   private handleSearchSessions = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const result = await this.searchManager.searchSessions(req.query);
@@ -334,7 +334,8 @@ export class SearchRoutes extends BaseRouteHandler {
           description: 'Search session summaries using full-text search',
           parameters: {
             query: 'Search query (required)',
-            limit: 'Number of results (default: 20)'
+            limit: 'Number of results (default: 20)',
+            project: 'Filter by project name (optional)'
           }
         },
         {
