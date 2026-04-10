@@ -261,7 +261,7 @@ export class SDKAgent {
           }
 
           // Parse and process response using shared ResponseProcessor
-          await processAgentResponse(
+          const result = await processAgentResponse(
             textContent,
             session,
             this.dbManager,
@@ -273,6 +273,27 @@ export class SDKAgent {
             cwdTracker.lastCwd,
             modelId
           );
+
+          if (result.status === 'rate_limited' || result.status === 'error') {
+            // Roll back the user prompt we pushed before the SDK call so retries
+            // don't accumulate stale context in conversationHistory.
+            session.conversationHistory.pop();
+          }
+
+          // Rate-limited: abort — subsequent calls will also fail
+          if (result.status === 'rate_limited') {
+            logger.warn('SDK', 'Aborting session due to rate limiting', {
+              sessionDbId: session.sessionDbId
+            });
+            session.abortController.abort();
+            return;
+          }
+
+          // On error: continue the loop rather than returning. The failed messages
+          // are already preserved via markFailed() for retry. Returning would kill
+          // the subprocess and trigger crash-recovery, burning through restart limits
+          // on transient errors (e.g., empty responses after worker restarts).
+          // Only rate_limited warrants aborting, since subsequent calls will also fail.
         }
 
         // Log result messages

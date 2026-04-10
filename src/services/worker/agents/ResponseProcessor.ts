@@ -21,9 +21,85 @@ import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
 import type { ActiveSession } from '../../worker-types.js';
 import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
-import type { WorkerRef, StorageResult } from './types.js';
+import type { WorkerRef, StorageResult, ProcessAgentResponseResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
 import { cleanupProcessedMessages } from './SessionCleanupHelper.js';
+
+// ============================================================================
+// Response Classification
+// ============================================================================
+
+/**
+ * Detect rate-limit responses returned as text by AI providers.
+ * These require message preservation for retry, not silent discard.
+ */
+export function isRateLimitResponse(text: string): boolean {
+  const lower = text.toLowerCase();
+  const patterns = [
+    "you've hit your limit",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota exceeded",
+    "try again later",
+    "please wait",
+    "usage cap",
+    "billing limit",
+  ];
+  if (patterns.some(p => lower.includes(p))) return true;
+  // "resets at 7pm", "resets in 2 hours", etc.
+  return /\bresets?\s+(at\s+\d|in\s+\d)/i.test(text);
+}
+
+/**
+ * Detect authentication error responses returned as text by AI providers.
+ * These indicate a configuration problem; messages should be preserved for retry
+ * once credentials are corrected.
+ */
+export function isAuthErrorResponse(text: string): boolean {
+  const lower = text.toLowerCase();
+  const patterns = [
+    "invalid api key",
+    "invalid bearer token",
+    "authentication_error",
+    "invalid x-api-key",
+    "api key expired",
+    "invalid_api_key",
+    '"type":"authentication_error"',
+    '"unauthorized"',
+  ];
+  return patterns.some(p => lower.includes(p));
+}
+
+// ============================================================================
+// Message Preservation Helper
+// ============================================================================
+
+/**
+ * Mark all currently-processing messages as failed (for retry) and clean up session state.
+ * Called on any non-successful response to ensure messages are never silently lost.
+ */
+function preserveMessages(
+  session: ActiveSession,
+  sessionManager: SessionManager,
+  worker: WorkerRef | undefined,
+  reason: string
+): void {
+  const pendingStore = sessionManager.getPendingMessageStore();
+  const ids = session.processingMessageIds;
+
+  if (ids.length > 0) {
+    for (const messageId of ids) {
+      pendingStore.markFailed(messageId);
+    }
+    logger.info('QUEUE', `PRESERVED | sessionDbId=${session.sessionDbId} | reason=${reason} | count=${ids.length} | ids=[${ids.join(',')}]`, {
+      sessionId: session.sessionDbId
+    });
+    session.processingMessageIds = [];
+  }
+
+  cleanupProcessedMessages(session, worker);
+}
 
 /**
  * Process agent response text (parse XML, save to database, sync to Chroma, broadcast SSE)
@@ -56,30 +132,83 @@ export async function processAgentResponse(
   agentName: string,
   projectRoot?: string,
   modelId?: string
-): Promise<void> {
+): Promise<ProcessAgentResponseResult> {
   // Track generator activity for stale detection (Issue #1099)
   session.lastGeneratorActivity = Date.now();
 
-  // Add assistant response to shared conversation history for provider interop
-  if (text) {
-    session.conversationHistory.push({ role: 'assistant', content: text });
+  // --- GUARD: Empty response with pending messages ---
+  // The observation prompt explicitly allows the LLM to return empty to skip trivial
+  // tool uses. Genuine API failures produce non-empty error text (rate-limit notices,
+  // auth errors, HTTP bodies), so an empty string here is an intentional skip, not a
+  // transient error. Confirm and delete the messages rather than retrying them.
+  if (!text.trim() && session.processingMessageIds.length > 0) {
+    const pendingStore = sessionManager.getPendingMessageStore();
+    for (const messageId of session.processingMessageIds) {
+      pendingStore.confirmProcessed(messageId);
+    }
+    logger.info('QUEUE', `SKIPPED | sessionDbId=${session.sessionDbId} | reason=intentional_skip | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`, {
+      sessionId: session.sessionDbId
+    });
+    session.processingMessageIds = [];
+    cleanupProcessedMessages(session, worker);
+    return { status: 'skipped', observationCount: 0, summaryStored: false };
   }
 
   // Parse observations and summary
   const observations = parseObservations(text, session.contentSessionId);
   const summary = parseSummary(text, session.sessionDbId);
 
+  // --- GUARD: Unproductive response with pending messages ---
+  // Covers two cases:
+  //   1. No XML markers at all — the LLM returned an error message, rate-limit notice, etc.
+  //   2. XML markers present but parser produced nothing — truncated/malformed XML.
+  // <skip_summary> with no observations is intentional (init prompt); allow it through.
+  const hasXmlMarkers = /<observation\b|<summary\b|<skip_summary\b/.test(text);
+  const isIntentionalSkipOnly =
+    /<skip_summary\b/.test(text) &&
+    !/<observation\b/.test(text) &&
+    !/<summary\b/.test(text);
+
   if (
     text.trim() &&
     observations.length === 0 &&
     !summary &&
-    !/<observation>|<summary>|<skip_summary\b/.test(text)
+    (!hasXmlMarkers || (session.processingMessageIds.length > 0 && !isIntentionalSkipOnly))
   ) {
     const preview = text.length > 200 ? `${text.slice(0, 200)}...` : text;
-    logger.warn('PARSER', `${agentName} returned non-XML response; observation content was discarded`, {
+
+    if (isRateLimitResponse(text)) {
+      logger.warn('PARSER', `${agentName} returned rate-limit response; messages preserved for retry`, {
+        sessionId: session.sessionDbId,
+        preview
+      });
+      preserveMessages(session, sessionManager, worker, 'rate_limit');
+      return { status: 'rate_limited', observationCount: 0, summaryStored: false };
+    }
+
+    if (isAuthErrorResponse(text)) {
+      logger.error('PARSER', `${agentName} returned auth error response; messages preserved for retry`, {
+        sessionId: session.sessionDbId,
+        preview
+      });
+      preserveMessages(session, sessionManager, worker, 'auth_error');
+      return { status: 'error', observationCount: 0, summaryStored: false };
+    }
+
+    const reason = hasXmlMarkers ? 'malformed_xml' : 'non_xml';
+    logger.warn('PARSER', `${agentName} returned ${reason === 'malformed_xml' ? 'malformed/truncated XML' : 'non-XML'} response; messages preserved for retry`, {
       sessionId: session.sessionDbId,
       preview
     });
+    preserveMessages(session, sessionManager, worker, reason);
+    return { status: 'error', observationCount: 0, summaryStored: false };
+  }
+
+  // Add assistant response to shared conversation history for provider interop.
+  // Done AFTER all early-return guards so error/rate-limit responses are never
+  // committed to history (callers pop their own user-prompt push on non-ok status).
+  if (text) {
+    session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
   // Convert nullable fields to empty strings for storeSummary (if summary exists)
@@ -164,6 +293,12 @@ export async function processAgentResponse(
 
   // Clean up session state
   cleanupProcessedMessages(session, worker);
+
+  return {
+    status: observations.length > 0 || summaryForStore ? 'ok' : 'empty',
+    observationCount: observations.length,
+    summaryStored: !!summaryForStore,
+  };
 }
 
 /**
