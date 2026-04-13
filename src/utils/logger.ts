@@ -32,7 +32,7 @@ class Logger {
   private level: LogLevel | null = null;
   private useColor: boolean;
   private logFilePath: string | null = null;
-  private logFileInitialized: boolean = false;
+  private logFileDate: string | null = null;
 
   constructor() {
     // Disable colors when output is not a TTY (e.g., PM2 logs)
@@ -44,8 +44,11 @@ class Logger {
    * Initialize log file path and ensure directory exists (lazy initialization)
    */
   private ensureLogFileInitialized(): void {
-    if (this.logFileInitialized) return;
-    this.logFileInitialized = true;
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+    // Rotate log file when the date changes (long-running server processes)
+    if (this.logFileDate === today) return;
 
     try {
       // Use default data directory to avoid circular dependency with SettingsDefaultsManager
@@ -57,13 +60,14 @@ class Logger {
         mkdirSync(logsDir, { recursive: true });
       }
 
-      // Create log file path with date
-      const date = new Date().toISOString().split('T')[0];
-      this.logFilePath = join(logsDir, `claude-mem-${date}.log`);
+      // Create log file path with current date
+      this.logFilePath = join(logsDir, `claude-mem-${today}.log`);
+      this.logFileDate = today;
     } catch (error) {
-      // If log file initialization fails, just log to console
+      // If log file initialization fails, allow retry on next call
       console.error('[LOGGER] Failed to initialize log file:', error);
       this.logFilePath = null;
+      this.logFileDate = null;
     }
   }
 
