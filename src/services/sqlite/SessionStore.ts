@@ -16,6 +16,7 @@ import type { PendingMessageStore } from './PendingMessageStore.js';
 import { computeObservationContentHash, findDuplicateObservation } from './observations/store.js';
 import { parseFileList } from './observations/files.js';
 import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource, sortPlatformSources } from '../../shared/platform-source.js';
+import { MigrationRunner } from './migrations/runner.js';
 
 function resolveCreateSessionArgs(
   customTitle?: string,
@@ -48,23 +49,9 @@ export class SessionStore {
     // Initialize schema if needed (fresh database)
     this.initializeSchema();
 
-    // Run migrations
-    this.ensureWorkerPortColumn();
-    this.ensurePromptTrackingColumns();
-    this.removeSessionSummariesUniqueConstraint();
-    this.addObservationHierarchicalFields();
-    this.makeObservationsTextNullable();
-    this.createUserPromptsTable();
-    this.ensureDiscoveryTokensColumn();
-    this.createPendingMessagesTable();
-    this.renameSessionIdColumns();
-    this.repairSessionIdColumnRename();
-    this.addFailedAtEpochColumn();
-    this.addOnUpdateCascadeToForeignKeys();
-    this.addObservationContentHashColumn();
-    this.addSessionCustomTitleColumn();
-    this.addSessionPlatformSourceColumn();
-    this.addObservationModelColumns();
+    // Run the shared migration pipeline so worker and standalone DB paths stay aligned.
+    const migrationRunner = new MigrationRunner(this.db);
+    migrationRunner.runAllMigrations();
   }
 
   /**
@@ -1349,6 +1336,25 @@ export class SessionStore {
   }
 
   /**
+   * Mark an observation as stale and record the ID of its correction
+   */
+  markObservationStale(staleId: number, correctedById: number): void {
+    this.db.prepare(
+      'UPDATE observations SET is_stale = 1, corrected_by_id = ? WHERE id = ?'
+    ).run(correctedById, staleId);
+  }
+
+  /**
+   * Set the importance score (1-10) for an observation
+   */
+  setObservationImportance(id: number, importance: number): void {
+    const clamped = Math.min(10, Math.max(1, Math.round(importance)));
+    this.db.prepare(
+      'UPDATE observations SET importance = ? WHERE id = ?'
+    ).run(clamped, id);
+  }
+
+  /**
    * Get observations by array of IDs with ordering and limit
    */
   getObservationsByIds(
@@ -1749,6 +1755,53 @@ export class SessionStore {
       id: Number(result.lastInsertRowid),
       createdAtEpoch: timestampEpoch
     };
+  }
+
+  /**
+   * ATOMIC: store a correction observation and mark the original observation stale.
+   */
+  contradictObservation(
+    staleId: number,
+    memorySessionId: string,
+    project: string,
+    observation: {
+      type: string;
+      title: string | null;
+      subtitle: string | null;
+      facts: string[];
+      narrative: string | null;
+      concepts: string[];
+      files_read: string[];
+      files_modified: string[];
+    },
+    promptNumber?: number,
+    discoveryTokens: number = 0,
+    overrideTimestampEpoch?: number,
+    generatedByModel?: string
+  ): { id: number; createdAtEpoch: number } {
+    const contradictTx = this.db.transaction(() => {
+      const result = this.storeObservation(
+        memorySessionId,
+        project,
+        observation,
+        promptNumber,
+        discoveryTokens,
+        overrideTimestampEpoch,
+        generatedByModel
+      );
+
+      const updateResult = this.db.prepare(
+        'UPDATE observations SET is_stale = 1, corrected_by_id = ? WHERE id = ?'
+      ).run(result.id, staleId);
+
+      if (updateResult.changes === 0) {
+        throw new Error(`Observation #${staleId} not found`);
+      }
+
+      return result;
+    });
+
+    return contradictTx();
   }
 
   /**

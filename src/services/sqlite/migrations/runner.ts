@@ -37,6 +37,8 @@ export class MigrationRunner {
     this.addSessionCustomTitleColumn();
     this.createObservationFeedbackTable();
     this.addSessionPlatformSourceColumn();
+    this.addObservationModelColumns();
+    this.addTemporalScoringColumns();
   }
 
   /**
@@ -619,6 +621,36 @@ export class MigrationRunner {
   }
 
   /**
+   * Add temporal scoring and staleness tracking columns to observations (migration 27)
+   */
+  private addTemporalScoringColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(27) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const existingColumns = new Set(tableInfo.map(col => col.name));
+
+    if (!existingColumns.has('last_accessed_at')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN last_accessed_at INTEGER');
+    }
+    if (!existingColumns.has('access_count')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!existingColumns.has('importance')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN importance INTEGER NOT NULL DEFAULT 5');
+    }
+    if (!existingColumns.has('is_stale')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!existingColumns.has('corrected_by_id')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN corrected_by_id INTEGER');
+    }
+    logger.debug('DB', 'Ensured temporal scoring columns on observations table');
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
+  }
+
+  /**
    * Add failed_at_epoch column to pending_messages (migration 20)
    * Used by markSessionMessagesFailed() for error recovery tracking
    */
@@ -921,5 +953,28 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+  }
+
+  /**
+   * Add generated_by_model and relevance_count columns to observations (migration 26)
+   *
+   * Column existence is the source of truth because some databases may have
+   * partially applied schema history from older builds.
+   */
+  private addObservationModelColumns(): void {
+    const columns = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const hasGeneratedByModel = columns.some(col => col.name === 'generated_by_model');
+    const hasRelevanceCount = columns.some(col => col.name === 'relevance_count');
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(26) as SchemaVersion | undefined;
+
+    if (!hasGeneratedByModel) {
+      this.db.run('ALTER TABLE observations ADD COLUMN generated_by_model TEXT');
+    }
+    if (!hasRelevanceCount) {
+      this.db.run('ALTER TABLE observations ADD COLUMN relevance_count INTEGER DEFAULT 0');
+    }
+
+    if (applied && hasGeneratedByModel && hasRelevanceCount) return;
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
   }
 }

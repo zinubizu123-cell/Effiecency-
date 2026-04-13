@@ -104,7 +104,8 @@ describe('SearchOrchestrator', () => {
       searchUserPrompts: mock(() => [mockPrompt]),
       findByConcept: mock(() => [mockObservation]),
       findByType: mock(() => [mockObservation]),
-      findByFile: mock(() => ({ observations: [mockObservation], sessions: [mockSession] }))
+      findByFile: mock(() => ({ observations: [mockObservation], sessions: [mockSession] })),
+      rankByTemporalScore: mock((obs: any[]) => obs)
     };
 
     mockSessionStore = {
@@ -148,6 +149,14 @@ describe('SearchOrchestrator', () => {
         expect(result.strategy).toBe('chroma');
         expect(result.usedChroma).toBe(true);
         expect(mockChromaSync.queryChroma).toHaveBeenCalled();
+      });
+
+      it('should preserve semantic ordering for text queries', async () => {
+        await orchestrator.search({
+          query: 'semantic search query'
+        });
+
+        expect(mockSessionSearch.rankByTemporalScore).not.toHaveBeenCalled();
       });
 
       it('should fall back to SQLite when Chroma fails', async () => {
@@ -313,14 +322,20 @@ describe('SearchOrchestrator', () => {
     });
 
     describe('search', () => {
-      it('should return empty results for query search without Chroma', async () => {
+      it('should fall back to SQLite FTS5 for query search without Chroma', async () => {
         const result = await orchestrator.search({
           query: 'semantic query'
         });
 
-        // No Chroma available, can't do semantic search
-        expect(result.results.observations).toHaveLength(0);
+        // Without Chroma, falls back to SQLite FTS5 search
         expect(result.usedChroma).toBe(false);
+        expect(result.strategy).toBe('sqlite');
+        expect(mockSessionSearch.searchObservations).toHaveBeenCalledWith(
+          'semantic query',
+          expect.objectContaining({})
+        );
+        expect(mockSessionSearch.searchSessions).not.toHaveBeenCalled();
+        expect(mockSessionSearch.searchUserPrompts).not.toHaveBeenCalled();
       });
 
       it('should still work for filter-only queries', async () => {
