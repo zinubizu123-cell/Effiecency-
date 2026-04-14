@@ -9,12 +9,14 @@
  * - Core system endpoints (health, readiness, version, admin)
  */
 
-import express, { Request, Response, Application } from 'express';
+import crypto from 'crypto';
+import express, { Request, Response, NextFunction, Application } from 'express';
 import http from 'http';
 import * as fs from 'fs';
 import path from 'path';
 import { ALLOWED_OPERATIONS, ALLOWED_TOPICS } from './allowed-constants.js';
 import { logger } from '../../utils/logger.js';
+import { DATA_DIR } from '../../shared/paths.js';
 import { createMiddleware, summarizeRequestBody, requireLocalhost } from './Middleware.js';
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
 import { getSupervisor } from '../../supervisor/index.js';
@@ -74,10 +76,12 @@ export class Server {
   private server: http.Server | null = null;
   private readonly options: ServerOptions;
   private readonly startTime: number = Date.now();
+  private readonly adminToken: string;
 
   constructor(options: ServerOptions) {
     this.options = options;
     this.app = express();
+    this.adminToken = this.initAdminToken();
     this.setupMiddleware();
     this.setupCoreRoutes();
   }
@@ -237,8 +241,10 @@ export class Server {
       }
     });
 
-    // Admin endpoints for process management (localhost-only)
-    this.app.post('/api/admin/restart', requireLocalhost, async (_req: Request, res: Response) => {
+    // Admin endpoints for process management (localhost-only, token-required)
+    const adminTokenMiddleware = (req: Request, res: Response, next: NextFunction) =>
+      this.requireAdminToken(req, res, next);
+    this.app.post('/api/admin/restart', requireLocalhost, adminTokenMiddleware, async (_req: Request, res: Response) => {
       res.json({ status: 'restarting' });
 
       // Handle Windows managed mode via IPC
@@ -263,7 +269,7 @@ export class Server {
       }
     });
 
-    this.app.post('/api/admin/shutdown', requireLocalhost, async (_req: Request, res: Response) => {
+    this.app.post('/api/admin/shutdown', requireLocalhost, adminTokenMiddleware, async (_req: Request, res: Response) => {
       res.json({ status: 'shutting_down' });
 
       // Handle Windows managed mode via IPC
@@ -290,7 +296,7 @@ export class Server {
     });
 
     // Doctor endpoint - diagnostic view of supervisor, processes, and health
-    this.app.get('/api/admin/doctor', requireLocalhost, (_req: Request, res: Response) => {
+    this.app.get('/api/admin/doctor', requireLocalhost, adminTokenMiddleware, (_req: Request, res: Response) => {
       const supervisor = getSupervisor();
       const registry = supervisor.getRegistry();
       const allRecords = registry.getAll();
@@ -333,6 +339,89 @@ export class Server {
       });
     });
   }
+
+  /**
+   * Generate a cryptographically random admin token, persist it to disk with
+   * mode 0o600 (owner read/write only), and return it.  Authorised callers
+   * read the token from DATA_DIR/admin.token and pass it as:
+   *   Authorization: Bearer <token>
+   *
+   * Security note: The disk-backed token can be read by any process running as
+   * the same OS user. This is an accepted trade-off to allow legitimate admin
+   * tools to authenticate. For stronger isolation, consider Unix domain sockets
+   * with peer credential checking.
+   *
+   * Uses an atomic write (temp file + rename) so readers never see a truncated
+   * token on crash.  Uses recursive mkdirSync without an existsSync pre-check
+   * to avoid a TOCTOU race when two server processes start in parallel.
+   */
+  private initAdminToken(): string {
+    // Ensure DATA_DIR exists before writing token.
+    // recursive: true is a no-op when the directory already exists and avoids
+    // the existsSync + mkdirSync race condition.
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    } catch (mkdirErr) {
+      logger.warn('SECURITY', 'Failed to create data directory for admin token', {
+        dataDir: DATA_DIR,
+        error: mkdirErr instanceof Error ? mkdirErr.message : String(mkdirErr),
+      });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenPath = path.join(DATA_DIR, 'admin.token');
+    const tokenPathTmp = tokenPath + '.tmp';
+    try {
+      // Atomic write: write to a temp file then rename so readers never see a
+      // partially-written token on crash.
+      fs.writeFileSync(tokenPathTmp, token, { mode: 0o600 });
+      fs.renameSync(tokenPathTmp, tokenPath);
+    } catch (err) {
+      // Best-effort cleanup of the temp file if the rename failed
+      try { fs.unlinkSync(tokenPathTmp); } catch { /* ignore */ }
+      logger.warn('SECURITY', 'Failed to write admin token file - admin endpoints still require a valid token', {
+        tokenPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return token;
+  }
+
+  /**
+   * Middleware that enforces a shared-secret Bearer token on admin endpoints.
+   * Uses a constant-time comparison to prevent timing-based token oracle attacks.
+   */
+  private requireAdminToken(req: Request, res: Response, next: NextFunction): void {
+    const authHeader = req.headers['authorization'];
+    const prefix = 'Bearer ';
+
+    if (!authHeader || !authHeader.startsWith(prefix)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const provided = authHeader.slice(prefix.length);
+
+    // Use constant-time comparison to prevent timing oracle attacks.
+    // Both buffers must be the same byte length for timingSafeEqual.
+    try {
+      const providedBuf = Buffer.from(provided, 'utf8');
+      const expectedBuf = Buffer.from(this.adminToken, 'utf8');
+      if (
+        providedBuf.length !== expectedBuf.length ||
+        !crypto.timingSafeEqual(providedBuf, expectedBuf)
+      ) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+    } catch {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    next();
+  }
+
 
   /**
    * Extract a specific section from instruction content
