@@ -6,5 +6,17 @@
       "Read(./node_modules/**)",
       "Read(./.DS_Store)"
     ]
+  },
+  "extraKnownMarketplaces": {
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-for-legal",
+        "ref": "main"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "claude-for-legal@claude-plugins-official": true
   }
 }
